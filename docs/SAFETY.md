@@ -1,11 +1,21 @@
 # Safety, command review, and undo
 
+## Pre-execution hook
+
+The [hook layer](HOOKS.md) runs before command review, repeats the check after
+approval, and also guards the subprocess and managed-file execution boundaries.
+Matched critical rules block execution even if the user would press Enter.
+The startup card shows that this hook is active. Ordinary read-only commands
+and safe file changes use the automatic allowlist; other nonblocked risky commands use review.
 
 | Command category | Behavior |
 | --- | --- |
+| Matched secret access, forced recursive deletion, destructive Git/SQL, primary-branch pushes | Blocked by hook; no confirmation override |
 | `pwd`, `ls`, `cat`, `head`, `tail`, `wc`, `stat`, `du`, restricted `find` | Automatic only with recognized flags, workspace paths, and the required read-only checks |
+| `echo`, `printf`, `whoami`, `id`, `uname`, date display, restricted `grep` | Automatic for recognized non-mutating forms; file searches validate paths |
 | `cd` | Changes the agent's working directory within the workspace |
-| Basic `rm`, `mv`, `cp`, `mkdir`, `touch` | Requires confirmation; uses managed file operations and backups |
+| `mkdir`, `touch`, copies to unused destinations | Automatic, with managed undo; `touch` preserves file contents |
+| `rm`, `mv`, copies overwriting existing destinations | Requires confirmation; uses managed file operations and backups |
 | Other installed programs, unsupported read options | Requires confirmation; displays a risk description; no automatic undo |
 | Pipes, chaining, redirection, substitutions, escapes, expansions, assignments | Warns and requires Enter; runs the original expression in Bash; no automatic undo |
 | Control characters, multiline commands, plain executable paths | Blocked |
@@ -14,11 +24,11 @@
 For example, `ls -la | head -n 10` now displays a **SHELL REVIEW** card and a risk
 warning. Enter executes the expression, Esc cancels, and `/exit` leaves the agent.
 The complete original expression is shown and passed to Bash without rewriting
-its quotes or escapes. Expressions are never run automatically, including when
-their special characters occur inside quotes. Bash interprets those quotes
-normally after approval.
+its quotes or escapes. Active shell expressions require confirmation. Harmless
+quoted literals such as `echo 'hello; world'` or `printf '%s\n' hello` can run
+directly as argument lists without invoking Bash or asking permission.
 
-Shell expressions can call programs normally blocked as simple commands and can
+Hook-allowed shell expressions can call programs normally blocked as simple commands and can
 write outside the workspace. Review every step, redirect, and substitution before
 approving. Undo and managed-file backups do not apply to these expressions.
 
@@ -26,8 +36,8 @@ Automatic file reads reject credential/configuration names such as `.env`,
 `.ssh`, `.aws`, `.git`, private-key files, and paths leaving the workspace.
 Recursive reads reject symbolic links. `find` automatically permits only explicit
 paths with `-name`, `-iname`, `-type f/d`, depth/size filters, and `-print`.
-`find -delete` is never treated as a safe read; it requires confirmation and has
-no undo. Prefer a plain `rm` with explicit paths when undo is needed.
+`find -delete` is blocked by the hook. Prefer a plain `rm` or managed `rm -r`
+with explicit paths when undo is needed; `rm -rf` is blocked.
 
 Managed file changes reject protected paths, symbolic-link traversal, hard-linked
 or special files, overlapping targets, and changes to the workspace root.
@@ -35,8 +45,18 @@ Supported flags are `rm -r/-R/-f`, `cp -r/-R`, and `mkdir -p`; `--` is supported
 before filenames. File-change commands with wildcards go through Bash review
 and have no managed backups. Use explicit filenames for undoable changes.
 
+Automatic copies create destinations exclusively rather than truncating an
+existing file. If another process creates the destination concurrently, the copy
+fails and preserves that file. Failed automatic creation only rolls back targets
+that the action actually changed. Non-empty newly created directories are retained
+for manual recovery on failure, preserving any work another process added there.
+Existing concurrent-process and hostile-filesystem
+race limitations described below still apply.
+
 Other security measures:
 
+- The deterministic hook inspects matched critical operations independently of
+  the model's safety claims; see its [coverage and limits](HOOKS.md#limits).
 - Simple commands execute as argument lists from `/usr/bin` or `/bin`. Approved
   shell expressions use an explicit Bash invocation, with startup profiles
   disabled and `pipefail` enabled so a failing pipeline step reports failure.

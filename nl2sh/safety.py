@@ -32,7 +32,7 @@ LONG_FLAGS = {"ls": {"--all", "--almost-all", "--human-readable", "--directory"}
 
 
 def protected(path):
-    return any(part.lower() in PROTECTED or part.lower().startswith(".env")
+    return any(part.lower() in PROTECTED or (part.lower().startswith(".env") and part.lower() != ".env.example")
                or part.lower().endswith((".pem", ".key")) for part in path.parts)
 
 
@@ -95,6 +95,47 @@ def no_link_tree(path, protect=True):
 
 def read_only(argv, cwd, workspace):
     name = argv[0]
+    if name in ("echo", "printf", "whoami", "id", "uname"):
+        return
+    if name == "date":
+        if len(argv) == 1 or (len(argv) == 2 and argv[1].startswith("+")):
+            return
+        raise SafetyError("Only date display/formatting is automatic; clock changes require review.")
+    if name == "grep":
+        i = 1
+        pattern = recursive = operands_only = False
+        while i < len(argv):
+            arg = argv[i]
+            if arg == "--":
+                operands_only = True
+                i += 1
+                break
+            if arg == "-e":
+                if i + 1 >= len(argv):
+                    raise SafetyError("grep -e requires a pattern.")
+                pattern = True
+                i += 2
+            elif arg.startswith("-"):
+                if len(arg) < 2 or arg.startswith("--") or not set(arg[1:]) <= set("nivrlcwFEhHsoxLaIR"):
+                    raise SafetyError("This grep option requires review.")
+                recursive |= bool(set(arg[1:]) & set("rR"))
+                i += 1
+            else:
+                break
+        if not pattern:
+            if i >= len(argv):
+                raise SafetyError("grep requires a pattern and file paths.")
+            i += 1
+        files = argv[i:]
+        if not files or any(arg.startswith("-") and not operands_only for arg in files):
+            raise SafetyError("grep requires explicit file paths, with options before the pattern.")
+        for arg in files:
+            path = workspace_path(arg, cwd, workspace)
+            if recursive:
+                no_link_tree(path)
+            elif not path.is_file():
+                raise SafetyError("Automatic grep requires regular files.")
+        return
     if name == "find":
         if len(argv) < 2 or argv[1].startswith("-"):
             raise SafetyError("Use find with an explicit workspace path.")
@@ -167,9 +208,37 @@ def shell_decision(command):
     )
 
 
+def needs_shell(command):
+    """Distinguish active shell syntax from literal characters inside quotes."""
+    quote = None
+    escaped = False
+    for char in command:
+        if escaped:
+            escaped = False
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if quote == '"':
+            if char == '"':
+                quote = None
+            elif char in "$`":
+                return True
+            continue
+        if char in "'\"":
+            quote = char
+        elif char in "|&;<>`$()~":
+            return True
+    return False
+
+
 def assess(command, cwd, workspace):
     validate_source(command)
-    if any(c in command for c in "|&;<>`$\\()~") or re.match(r"\s*[A-Za-z_][A-Za-z0-9_]*=", command):
+    if needs_shell(command) or re.match(r"\s*[A-Za-z_][A-Za-z0-9_]*=", command):
         return shell_decision(command)
     argv = parse_command(command)
     if argv[0] == "cd":

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .safety import SafetyError, no_link_tree, workspace_path
+from .hooks import pre_execute
 
 MAX_BACKUP_BYTES = 100 * 1024 * 1024
 MAX_ENTRIES = 10000
@@ -62,6 +63,15 @@ def copy_path(source, target):
         shutil.copy2(source, target)
 
 
+def copy_new_file(source, target):
+    """Create a copy without replacing a destination that appeared concurrently."""
+    target = Path(target)
+    with Path(source).open("rb") as input_file, target.open("xb") as output_file:
+        shutil.copyfileobj(input_file, output_file)
+    shutil.copystat(source, target)
+    return str(target)
+
+
 def remove_path(path):
     if path.is_symlink() or path.is_file():
         path.unlink()
@@ -76,6 +86,11 @@ class Plan:
     targets: list[Path]
     recursive: bool = False
     parents: bool = False
+    force: bool = False
+
+    @property
+    def automatic(self):
+        return self.name in ("mkdir", "touch") or (self.name == "cp" and not self.operands[1].exists())
 
     def describe(self):
         return "\n".join("  " + str(path) for path in self.targets)
@@ -147,12 +162,14 @@ def plan_change(argv, cwd, workspace):
             elif not target.parent.is_dir():
                 raise SafetyError("Parent directory does not exist; use mkdir -p.")
             targets.append(target)
-        targets = [p for p in set(targets) if not any(q != p and p.is_relative_to(q) for q in targets)]
+        targets = sorted(p for p in set(targets) if not any(q != p and p.is_relative_to(q) for q in targets))
     else:
         if any(path.is_dir() or not path.parent.is_dir() for path in paths):
             raise SafetyError("touch requires file targets with existing parent directories.")
         targets = paths[:]
     if not targets:
+        if name == "mkdir" and parents:
+            return Plan(name, paths, [], recursive, parents, force)
         raise SafetyError("No filesystem changes are needed.")
     if len(set(targets)) != len(targets) or any(
         p != q and (p.is_relative_to(q) or q.is_relative_to(p)) for p in targets for q in targets
@@ -161,7 +178,7 @@ def plan_change(argv, cwd, workspace):
     size = sum(p.stat().st_size for target in targets for p in inspect_tree(target) if p.is_file())
     if size > MAX_BACKUP_BYTES:
         raise SafetyError("Combined backup exceeds 100 MiB.")
-    return Plan(name, paths, targets, recursive, parents)
+    return Plan(name, paths, targets, recursive, parents, force)
 
 
 class Journal:
@@ -231,15 +248,33 @@ class Journal:
             if item["before"] is not None:
                 copy_path(record_path.parent / item["backup"], path)
 
-    def apply(self, plan):
+    def apply(self, plan, *, automatic=False):
+        flags = (["-r"] if plan.recursive else []) + (["-f"] if plan.force else [])
+        pre_execute([plan.name, *flags, *map(str, plan.operands)], self.workspace)
+        if automatic and not plan.automatic:
+            raise SafetyError("This change now requires review; nothing was executed automatically.")
         record_path, record = self.create(plan.name, True, plan.targets)
+        changed = set()
         try:
+            if automatic and plan.name == "cp" and any(item["before"] is not None for item in record["targets"]):
+                raise SafetyError("Copy destination appeared; review is required before replacing it.")
             if plan.name == "rm":
                 for path in plan.operands:
                     remove_path(path)
             elif plan.name == "cp":
                 source, target = plan.operands
-                if source.is_dir():
+                if automatic and source.is_dir():
+                    target.mkdir()
+                    changed.add(target)
+                    shutil.copytree(source, target, dirs_exist_ok=True, copy_function=copy_new_file)
+                elif automatic:
+                    # Reserve the destination before copying, so no existing file is truncated.
+                    with target.open("xb") as output_file:
+                        changed.add(target)
+                        with source.open("rb") as input_file:
+                            shutil.copyfileobj(input_file, output_file)
+                    shutil.copystat(source, target)
+                elif source.is_dir():
                     shutil.copytree(source, target, dirs_exist_ok=True, copy_function=shutil.copy2)
                 else:
                     shutil.copy2(source, target)
@@ -249,17 +284,39 @@ class Journal:
                     remove_path(target)
                 shutil.move(str(source), str(target))
             elif plan.name == "mkdir":
+                if automatic:
+                    for path in plan.targets:
+                        path.mkdir()
+                        changed.add(path)
                 for path in plan.operands:
-                    path.mkdir(parents=plan.parents, exist_ok=plan.parents)
+                    path.mkdir(parents=plan.parents, exist_ok=plan.parents or automatic)
             elif plan.name == "touch":
                 for path in plan.operands:
                     path.touch()
+                    changed.add(path)
             for item in record["targets"]:
                 item["after"] = fingerprint(Path(item["path"]))
             record["status"] = "done"
             self.save(record_path, record)
         except Exception:
-            self.restore(record_path, record)
+            rollback = record
+            if automatic:
+                restore_items = []
+                for item in record["targets"]:
+                    path = Path(item["path"])
+                    if path not in changed:
+                        continue
+                    if item["before"] is None and path.is_dir():
+                        # Never recursively delete a new directory after an automatic failure:
+                        # another process may already have put its own files there.
+                        try:
+                            path.rmdir()
+                        except OSError:
+                            raise SafetyError(f"Automatic creation failed. Non-empty directory preserved: {path}. Inspect recovery state in {record_path.parent}.") from None
+                    else:
+                        restore_items.append(item)
+                rollback = {**record, "targets": restore_items}
+            self.restore(record_path, rollback)
             record["status"] = "rolled-back"
             self.save(record_path, record)
             raise

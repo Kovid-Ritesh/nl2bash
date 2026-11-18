@@ -11,27 +11,48 @@ from .safety import SafetyError, assess, workspace_path
 from .undo import Journal, fingerprint, plan_change
 from . import ui
 from .ui import confirm, ExitRequested
+from .hooks import GuardrailBlocked, pre_execute
 
-DEFAULT_ENDPOINT = "https://even-spendable-eccentric.ngrok-free.dev"
+DEFAULT_ENDPOINT = "https://YOUR-NGROK-DOMAIN.ngrok-free.dev"
 HELP = """Enter a natural-language shell task.
   /undo       Undo the latest supported file change (checks for later edits)
   /history    Show local action history; prompts and output are not stored
   /pwd        Show the current directory
   /help       Show this help
   /exit       Exit
-Safe allowlisted reads run automatically. Review other commands: Enter executes, Esc cancels.
+Normal reads, mkdir, touch, and non-overwriting copies run automatically.
+Deletion, overwrites, moves, and other risky commands require review: Enter executes, Esc cancels.
 rm/cp/mv/mkdir/touch use managed backups; arbitrary programs have no undo.
 Shell syntax requires review and has no automatic undo. Control characters remain blocked.
+Critical hook rules cannot be approved with Enter: secret access, forced deletion, destructive Git, and primary-branch pushes.
 """
 
 
 def handle_command(command, cwd, workspace, journal, dry_run=False, timeout=60, input_fn=None):
+    try:
+        pre_execute(command, cwd)
+    except GuardrailBlocked:
+        ui.panel("COMMAND", ["$ " + command], "red")
+        raise
     decision = assess(command, cwd, workspace)
+    plan = plan_change(decision.argv, cwd, workspace) if decision.kind == "managed" else None
+    automatic_change = plan is not None and plan.automatic
     titles = {"read": "READ ONLY", "cd": "DIRECTORY", "managed": "REVIEW REQUIRED", "risk": "REVIEW REQUIRED",
               "shell": "SHELL REVIEW"}
     shown_command = command if decision.kind == "shell" else shlex.join(decision.argv)
-    ui.panel(titles[decision.kind], ["$ " + shown_command],
-             "green" if decision.kind in ("read", "cd") else "yellow")
+    ui.panel("SAFE CHANGE" if automatic_change else titles[decision.kind], ["$ " + shown_command],
+             "green" if automatic_change or decision.kind in ("read", "cd") else "yellow")
+    if automatic_change:
+        if dry_run:
+            ui.notice("Preview only; nothing executed.")
+        elif not plan.targets:
+            ui.notice("Already exists; no changes needed.", "green")
+        else:
+            ui.notice("Running automatically within the workspace. Undo is available.")
+            pre_execute(command, cwd)
+            journal.apply(plan, automatic=True)
+            ui.notice("Done. Use /undo to restore the previous state.", "green")
+        return cwd, 0
     if decision.kind == "cd":
         if not dry_run:
             cwd = workspace_path(decision.argv[1], cwd, workspace)
@@ -40,10 +61,8 @@ def handle_command(command, cwd, workspace, journal, dry_run=False, timeout=60, 
     if decision.kind == "read":
         ui.notice("Preview only; nothing executed." if dry_run else "Running automatically within the workspace.")
         return cwd, 0 if dry_run else run_command(decision.argv, cwd, timeout)
-    plan = None
     before = {}
     if decision.kind == "managed":
-        plan = plan_change(decision.argv, cwd, workspace)
         before = {p: fingerprint(p) for p in set(plan.operands + plan.targets)}
         ui.panel("DANGEROUS", [decision.description, "", "Affected paths:", plan.describe(), "",
                                "Undo available: backups are created before this operation."], "red")
@@ -60,6 +79,7 @@ def handle_command(command, cwd, workspace, journal, dry_run=False, timeout=60, 
     if not confirm("[Enter] Execute   [Esc] Cancel   [/exit + Enter] Exit > ", input_fn):
         ui.notice("Cancelled; nothing executed.", "yellow")
         return cwd, 0
+    pre_execute(command, cwd)
     if plan:
         # Revalidate after the user has spent time reviewing the confirmation.
         plan = plan_change(decision.argv, cwd, workspace)
@@ -172,6 +192,11 @@ def main(argv=None):
                     ui.notice(f"Command exit status: {code}", "yellow")
                 if args.prompt:
                     return code
+            except GuardrailBlocked as error:
+                ui.panel("BLOCKED BY HOOK", [f"Rule: {error.rule}", str(error), "",
+                                             "Nothing executed. This rule cannot be overridden with Enter."], "red")
+                if args.prompt:
+                    return 2
             except ExitRequested:
                 ui.notice("Session closed. Back at your terminal.", "cyan")
                 break

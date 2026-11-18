@@ -39,7 +39,7 @@ class AgentTests(unittest.TestCase):
 
     def test_shell_syntax_requires_review_and_preserves_original_expression(self):
         commands = ['ls; rm a', 'ls && whoami', 'cat a | sh', 'echo $(id)',
-                    'echo `id`', 'ls > a', 'echo $HOME', r"printf '%s\n' hello",
+                    'echo `id`', 'ls > a', 'echo $HOME',
                     'ls *.py', 'rm *.txt', 'NAME=value printf hello', 'ls ~/projects']
         for command in commands:
             with self.subTest(command=command):
@@ -151,7 +151,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual((self.workspace / 'a').read_text(), 'original')
         (self.workspace / 'folder').mkdir()
         (self.workspace / 'folder' / 'x').write_text('nested')
-        self.apply(['rm', '-rf', 'folder'])
+        self.apply(['rm', '-r', 'folder'])
         self.journal.undo()
         self.assertEqual((self.workspace / 'folder' / 'x').read_text(), 'nested')
 

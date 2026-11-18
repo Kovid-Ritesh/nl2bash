@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from .safety import SafetyError
+from .hooks import pre_execute
 
 
 def display(text):
@@ -23,6 +24,7 @@ def trusted_executable(name):
 
 
 def run_command(argv, cwd, timeout=60, output_limit=1024 * 1024):
+    pre_execute(argv, cwd)
     executable = trusted_executable(argv[0])
     env = {"PATH": "/usr/bin:/bin", "HOME": str(Path.home()), "LANG": "C.UTF-8",
            "LC_ALL": "C.UTF-8", "TERM": "dumb"}

@@ -19,8 +19,9 @@ dependencies or local GPU requirement.
 ## What it does
 
 - Translates natural-language requests into shell commands.
-- Runs allowlisted read-only commands automatically inside your workspace.
+- Runs normal reads, display/search commands, file/directory creation, and non-overwriting copies automatically.
 - Explains risky commands and asks for **Enter to execute** or **Esc to cancel**.
+- Blocks matched critical actions with a pre-execution hook, even before confirmation.
 - Supports pipes, redirection, substitutions, and escapes after review.
 - Offers `/undo` for supported file changes, with backups and newer-edit checks.
 - Starts from any ordinary project folder using the `nl2bash` command.
@@ -56,77 +57,55 @@ and tunnel remain available; normal provider quotas and session limits apply.
 Use [the testing notebook](notebooks/nl2sh_inference_test.ipynb) in a separate
 CPU session or local Jupyter to enter prompts and inspect replies.
 
-## 2. Configure the CLI
+## 2. Install the CLI automatically
+
+Use the single-file **`nl2bash-installer.pyz`** bundle. It includes the app, Python
+installer, guardrail hook, guides, and Kaggle server/testing notebooks.
+
+Windows:
+
+```powershell
+py nl2bash-installer.pyz
+```
+
+Linux / WSL:
+
+```bash
+python3 nl2bash-installer.pyz
+```
+
+The installer copies the application into your user folder, creates the launcher,
+and adds its folder to your user PATH automatically. Existing PATH entries and
+configuration are preserved. On Windows, it also sets up the WSL launcher.
+Python 3.11+ is required; Windows needs an existing non-root WSL setup with
+Python 3.11+ as well. The local client does not need a GPU or pip dependencies.
+
+Enter your own Kaggle endpoint and API key at setup, or configure them later.
+The installer prints the installed notebook and `.env` locations. Your keys are
+not included in the bundle or added to PATH. Open a **new terminal** and run
+`nl2bash` from your project folder.
+
+See [the full installation guide](docs/INSTALL.md) for default folders, updating
+an ngrok URL, choosing a WSL distribution, and installation behavior.
+
+### From source
 
 ```bash
 git clone https://github.com/Kovid-Ritesh/nl2bash.git
 cd nl2bash
+python3 install.py
 ```
 
-Copy `.env.example` to `.env` (`cp .env.example .env` on Linux/WSL or
-`Copy-Item .env.example .env` in PowerShell). Edit the copy:
-
-```dotenv
-NL2SH_URL=https://YOUR-NGROK-DOMAIN.ngrok-free.dev
-# Optional; leave commented to enter the key at a hidden prompt:
-# NL2SH_API_KEY=the-same-private-key-you-saved-in-kaggle
-```
-
-The URL may be the endpoint root, `/v1`, or `/v1/chat/completions`. Use the URL
-printed by **your** serving notebook. The inference key must match its
-`NL2SH_API_KEY`; the ngrok authtoken is not the inference key.
-
-`launch.py` loads the repository's `.env` as data, without executing shell code.
-Explicit environment variables take precedence. An adjacent
-`../nl2sh-modal/.env` is also supported for earlier local setups. Configuration is
-read from the installed source location, not from an arbitrary working folder.
-Never commit `.env` or publish keys in notebook output.
-
-Start immediately without installing packages:
+On Windows, use `py install.py`. Build the single-file distribution with:
 
 ```bash
-python3 launch.py --workspace /path/to/your/project
+python3 scripts/build_installer.py
 ```
 
-## 3. Install the `nl2bash` command
-
-### Windows CMD / PowerShell
-
-Install Ubuntu WSL with Python 3.11+ and a non-root Linux user first. In
-PowerShell, from this repository:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\install-windows.ps1" -Distribution Ubuntu
-```
-
-If needed, select the Linux user with `-WslUser your-linux-user`. The installer
-creates `%USERPROFILE%\.local\bin\nl2bash.cmd`, adds that directory to your user
-PATH if absent, and installs the WSL launcher. It does not change system PATH.
-
-Open a new CMD or PowerShell terminal, enter your project folder, and run:
-
-```text
-nl2bash
-```
-
-The Windows launcher starts the Linux agent through WSL and preserves your
-current folder as the workspace. Generated commands use Linux/Bash syntax.
-
-### Linux / WSL
-
-```bash
-python3 scripts/install_wsl_launcher.py
-export PATH="$HOME/.local/bin:$PATH"
-nl2bash
-```
-
-Ensure `~/.local/bin` is included by your shell profile for future terminals.
-Keep this source checkout in place; rerun the installer after moving it.
-
-For a conventional Python installation, use a virtual environment and
-`python -m pip install -e .`. Its console entry point reads `NL2SH_URL` and
-`NL2SH_API_KEY` from the environment; use `launch.py` or the launchers above for
-automatic `.env` loading.
+For direct development without copying an installation, copy `.env.example` to
+`.env`, set your endpoint, and run `python3 launch.py`. Explicit environment
+variables take precedence. The launcher reads configuration as data rather than
+executing shell code. Never commit `.env` or notebook output containing secrets.
 
 ## Usage
 
@@ -173,11 +152,35 @@ state and is not sent to the model. Use explicit paths when your request needs t
 
 ## Command review and undo
 
-Recognized `pwd`, `ls`, `cat`, `head`, `tail`, `wc`, `stat`, `du`, and restricted
-`find` reads can run automatically after path and flag checks. Basic `rm`, `mv`,
-`cp`, `mkdir`, and `touch` actions require review and use managed backups.
+The [pre-execution hook](docs/HOOKS.md) runs before review and again at execution
+boundaries. It blocks matched secret-file access, `rm -rf`, destructive Git
+operations, direct pushes to `main`/`master`, and destructive SQL. Enter cannot
+override a hook block. `.env.example` templates remain readable.
 
-Shell expressions such as `ls -la | head -n 10` always require review. They run
+Other risky commands still use Enter/Esc review. This hook is local to the agent;
+it does not configure Claude Code, native Git hooks, or GitHub branch rules.
+
+Recognized reads and display/search commands run automatically after path and
+flag checks, including `ls`, `cat`, `head`, `grep`, `find`, `echo`, and `printf`.
+Quoted literal text is not treated as an active shell operator.
+
+These ordinary file operations also run without a permission prompt:
+
+```bash
+touch notes.txt
+mkdir -p project/src
+cp notes.txt notes-copy.txt
+cp -r project project-copy
+```
+
+`touch` preserves existing contents, and automatic copies require an unused
+destination. These changes are journaled and can be undone with `/undo`.
+Deletion, moves, and overwriting copies still require Enter/Esc review. A copy
+that discovers a newly created destination refuses to overwrite it automatically.
+General Bash expressions and scripts still require review because they may
+perform additional actions that cannot be classified as a simple safe operation.
+
+Hook-allowed shell expressions such as `ls -la | head -n 10` always require review. They run
 in Bash with profiles disabled and `pipefail` enabled. They have **no automatic
 backups or undo**, even if they include `rm` or another managed command.
 
@@ -219,13 +222,14 @@ isolation. Tests use temporary files and mocked inference responses; model
 quality and provider availability are separate from these CLI checks.
 
 ```text
-nl2sh/        CLI, safety policy, execution, terminal UI, and undo journal
+nl2sh/        CLI, pre-execution hook, safety policy, execution, UI, and undo
 scripts/      Windows and Linux/WSL launcher installers
 notebooks/    Kaggle serving and inference-testing notebooks
 huggingface/  Model README for the Hugging Face repository
 docs/         Detailed safety and recovery documentation
 tests/        Standard-library test suite
 launch.py     Startup with local configuration loading
+install.py    Automatic user installation and PATH setup
 ```
 
 ## Troubleshooting

@@ -91,6 +91,7 @@ def banner(workspace, dry_run):
     print()
     panel("SESSION", [f"Workspace  {workspace}",
                       "Mode       Preview only" if dry_run else "Mode       Guarded execution",
+                      "Hook       Active / critical actions blocked",
                       "", "Enter executes  /  Esc cancels  /  Ctrl+C interrupts"], "violet")
     for line in textwrap.wrap("/undo   /history   /pwd   /help   /exit", width=max(12, columns - 4)):
         notice("  " + line, "dim")
